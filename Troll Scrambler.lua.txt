@@ -1,0 +1,1993 @@
+-- ╔═══════════════════════════════════════════════════════════════════════╗
+-- ║  SAB ANTICHEAT CONTAINER v3 — AUTO-MANAGED BY sab_replacer.py        ║
+-- ║  AC patches + Net Module Proxy (game require) + SyncWrapper          ║
+-- ║  Uses require(game's Net module) for direct remote resolution.       ║
+-- ║  Each patch is flag-gated — first script applies, rest reuse.        ║
+
+
+-- ╚═══════════════════════════════════════════════════════════════════════╝
+
+-- Gate: Only Steal a Brainrot places
+local SAB_IDS = {[109983668079237]=true,[85621847059032]=true,[99606176102979]=true}
+if not SAB_IDS[game.PlaceId] then return end
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local RS = game:GetService("ReplicatedStorage")
+local _S = getgenv().__ASTRO_SYNC or {}
+getgenv().__ASTRO_SYNC = _S
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- FAST PATH — Skip heavy init if container already ran
+-- Subsequent scripts jump straight to exports (saves ~500 lines of parsing)
+
+
+-- ═══════════════════════════════════════════════════════════════
+if not _S._CONTAINER_READY then
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- EXECUTOR COMPATIBILITY SHIMS — Universal executor support
+-- Resolves intrinsics from globals, debug.*, or alternative names.
+-- Supports: Synapse X, Script-Ware, KRNL, Fluxus, Seliware, etc.
+
+
+-- ═══════════════════════════════════════════════════════════════
+do
+    local _dbg = type(debug) == "table" and debug or {}
+    local function _res(...)
+        for i = 1, select("#", ...) do
+            local v = select(i, ...)
+            if type(v) == "function" then return v end
+        end
+        return nil
+    end
+    _S._X = {
+        getupvalues   = _res(getupvalues, _dbg.getupvalues),
+        setupvalue    = _res(setupvalue, _dbg.setupvalue),
+        getconstants  = _res(getconstants, _dbg.getconstants),
+        setconstant   = _res(setconstant, _dbg.setconstant),
+        getprotos     = _res(getprotos, _dbg.getprotos),
+        getgc         = _res(getgc, _dbg.getgc),
+        getrenv       = _res(getrenv),
+        getconnections = _res(getconnections, get_signal_connections),
+        isexecutorclosure = _res(isexecutorclosure, checkclosure, is_synapse_function, isourclosure),
+        newcclosure   = _res(newcclosure) or function(fn) return fn end,
+    }
+end
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- NET MODULE PATCHER — Neuter ALL executor-detection vectors
+-- Based on dump analysis: getfenv/setfenv are stored as BOTH
+-- string constants AND function value constants, plus in upvalue
+-- tables. Also patches identifyexecutor/iscclosure/islclosure.
+
+
+-- ═══════════════════════════════════════════════════════════════
+if not getgenv()._net_getfenv_patched then
+    getgenv()._net_getfenv_patched = true
+    -- Block-scoped aliases for compat shims
+    local _getrenv = _S._X.getrenv
+    local _newcclosure = _S._X.newcclosure
+    local _getupvalues = _S._X.getupvalues
+    local _setupvalue = _S._X.setupvalue
+    local _getconstants = _S._X.getconstants
+    local _setconstant = _S._X.setconstant
+    local _getprotos = _S._X.getprotos
+    local _getgc = _S._X.getgc
+    local _isexecutorclosure = _S._X.isexecutorclosure
+
+    local Packages = game:GetService("ReplicatedStorage"):FindFirstChild("Packages")
+    local NetFolder = Packages and Packages:FindFirstChild("Net")
+    local NetScript = NetFolder and NetFolder:FindFirstChildWhichIsA("ModuleScript", true)
+    local renvGetfenv, renvSetfenv
+    if _getrenv then
+        pcall(function()
+            local renv = _getrenv()
+            renvGetfenv = renv.getfenv
+            renvSetfenv = renv.setfenv
+        end)
+    end
+
+    if NetScript then
+        -- Harmless dummies — no errors, just return nothing useful
+        local dummyGetfenv = _newcclosure(function() return {} end)
+        local dummySetfenv = _newcclosure(function() end)
+        local dummyIdentify = _newcclosure(function() return nil end)
+        local dummyIscclosure = _newcclosure(function() return false end)
+
+        local patched = 0
+
+        -- Check if a value is getfenv (executor or renv)
+        local function isGfe(v)
+            return type(v) == "function" and (v == getfenv or v == renvGetfenv)
+        end
+        -- Check if a value is setfenv
+        local function isSfe(v)
+            return type(v) == "function" and (v == setfenv or v == renvSetfenv)
+        end
+
+        -- Suspicious constant strings to kill
+        local killStrings = {
+            ["getfenv"] = true,
+            ["setfenv"] = true,
+            ["identifyexecutor"] = true,
+            ["isexecutorclosure"] = true,
+            ["iscclosure"] = true,
+            ["islclosure"] = true,
+        }
+
+        -- ── Patch a single function: upvalues + constants + protos ──
+        local _patchVisited = {}
+        local function patchFunc(fn)
+            if _patchVisited[fn] then return end
+            _patchVisited[fn] = true
+            -- UPVALUES: direct refs and table entries
+            if _getupvalues and _setupvalue then pcall(function()
+                local ups = _getupvalues(fn)
+                if not ups then return end
+                for i, v in pairs(ups) do
+                    -- Direct getfenv/setfenv upvalue
+                    if isGfe(v) then
+                        pcall(function() _setupvalue(fn, i, dummyGetfenv) end)
+                        patched = patched + 1
+                    elseif isSfe(v) then
+                        pcall(function() _setupvalue(fn, i, dummySetfenv) end)
+                        patched = patched + 1
+                    end
+                    -- Table upvalue: scan for getfenv/setfenv inside
+                    if type(v) == "table" then
+                        for tk, tv in pairs(v) do
+                            if isGfe(tv) then
+                                v[tk] = dummyGetfenv
+                                patched = patched + 1
+                            elseif isSfe(tv) then
+                                v[tk] = dummySetfenv
+                                patched = patched + 1
+                            end
+                        end
+                    end
+                end
+            end) end
+
+            -- CONSTANTS: both string names AND function value refs
+            if _getconstants then pcall(function()
+                local consts = _getconstants(fn)
+                if not consts then return end
+                for i, c in pairs(consts) do
+                    -- String constants: "getfenv", "identifyexecutor", etc
+                    if type(c) == "string" and killStrings[c] then
+                        if _setconstant then pcall(function() _setconstant(fn, i, "____dead") end) end
+                        patched = patched + 1
+                    end
+                    -- Function value constants: the actual getfenv/setfenv refs
+                    if isGfe(c) then
+                        if _setconstant then pcall(function() _setconstant(fn, i, dummyGetfenv) end) end
+                        patched = patched + 1
+                    elseif isSfe(c) then
+                        if _setconstant then pcall(function() _setconstant(fn, i, dummySetfenv) end) end
+                        patched = patched + 1
+                    end
+                end
+            end) end
+
+            -- PROTOS: recurse into inner functions
+            if _getprotos then pcall(function()
+                local protos = _getprotos(fn)
+                if protos then
+                    for _, proto in ipairs(protos) do
+                        patchFunc(proto)
+                    end
+                end
+            end) end
+        end
+
+        -- ── Pass 1: Walk require()'d module exports ──
+        pcall(function()
+            local ok, mod = pcall(require, NetScript)
+            if ok and mod and type(mod) == "table" then
+                for key, fn in pairs(mod) do
+                    if type(fn) == "function" then
+                        local isExec = false
+                        if _isexecutorclosure then pcall(function() isExec = _isexecutorclosure(fn) end) end
+                        if not isExec then patchFunc(fn) end
+                    end
+                end
+            end
+        end)
+
+        -- ── Pass 2: GC scan for closures belonging to Net ──
+        if _getgc then pcall(function()
+            for _, obj in ipairs(_getgc(true)) do
+                if type(obj) == "function" then
+                    local isExec = false
+                    if _isexecutorclosure then pcall(function() isExec = _isexecutorclosure(obj) end) end
+                    if not isExec then
+                        local src = nil
+                        pcall(function() src = getfenv(obj).script end)
+                        if src == NetScript then
+                            patchFunc(obj)
+                        end
+                    end
+                end
+            end
+        end) end
+
+        warn("[SAB Container] Net module patched — " .. patched .. " refs neutralized (getfenv/setfenv/identifyexecutor/iscclosure/islclosure)")
+    else
+        warn("[SAB Container] NetScript NOT FOUND — cannot patch")
+    end
+end
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- VERBOSE LOGGING
+
+
+-- ═══════════════════════════════════════════════════════════════
+local VERBOSE = false -- Set to true to enable container debug logging
+local function vLog(...)
+    if VERBOSE then warn("[SAB Container]", ...) end
+end
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- [PATCHES 0-1] Anti-cheat neutralization (flag-gated, idempotent)
+
+
+-- ═══════════════════════════════════════════════════════════════
+if not _S.ALL_PATCHES_APPLIED then
+    local _getconnections = _S._X.getconnections
+
+    -- [Patch 0] Destroy QuitsAntiCheat scripts
+    if not _S.AC_CLEANUP_DONE then
+        pcall(function()
+            for _, n in ipairs({"QuitsAntiCheatChecker", "QuitsAntiCheatLocal"}) do
+                for _, p in ipairs({
+                    game:GetService("Players").LocalPlayer.PlayerScripts,
+                    game:GetService("StarterPlayer").StarterPlayerScripts
+                }) do
+                    local c = p:FindFirstChild(n)
+                    if c then c:Destroy() end
+                end
+            end
+        end)
+        _S.AC_CLEANUP_DONE = true
+        _S.AC_CLEANUP_BY = _S.AC_CLEANUP_BY or "CONTAINER"
+    end
+
+    -- [Patch 1] Desync temp patch killer — destroy position correction remotes
+    if not _S.DESYNC_PATCH_KILLED then
+        pcall(function()
+            local df = RS:FindFirstChild("Desync")
+            if df then
+                for _, c in ipairs(df:GetChildren()) do
+                    if c:IsA("RemoteEvent") or c:IsA("UnreliableRemoteEvent") then
+                        pcall(function()
+                            if _getconnections then
+                                for _, cn in pairs(_getconnections(c.OnClientEvent)) do pcall(function() cn:Disable() end) end
+                            end
+                            c:Destroy()
+                        end)
+                    end
+                end
+            end
+        end)
+        pcall(function()
+            RS.DescendantAdded:Connect(function(d)
+                if d.Name == "UnreliableRemoteEvent" and d.Parent and d.Parent.Name == "Desync" then
+                    task.defer(function()
+                        pcall(function()
+                            if _getconnections then
+                                for _, cn in pairs(_getconnections(d.OnClientEvent)) do cn:Disable() end
+                            end
+                            d:Destroy()
+                        end)
+                    end)
+                end
+            end)
+        end)
+        _S.DESYNC_PATCH_KILLED = true
+    end
+
+    _S.ALL_PATCHES_APPLIED = true
+end
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- DUAL-FIRE ANTI-HOOK MAP
+
+
+-- ═══════════════════════════════════════════════════════════════
+if not _S.DUAL_FIRE_MAP then
+    _S.DUAL_FIRE_MAP = {
+        AnimalController = {
+            remote = "9ceddac0-775c-4449-ae9e-6fff3792c8a1",
+            shadowUUID = "3d3ab689-343b-4632-8337-3ee5eb6e505e",
+            primaryUUID = "3ce04c41-b21f-4b2a-b93a-037427eac16d",
+            timeOffset = 43,
+        },
+        PlotClient = {
+            remote = "3ba148c9-7ed6-4675-93f8-9f7c356a2c54",
+            shadowUUID = "cda5c764-d4e3-45c4-94e4-53a538347590",
+            primaryUUID = "8c852fbf-d542-4ef4-aa28-612e24db8d4a",
+            timeOffset = 31,
+        },
+        AnimalPrompt = {
+            remote = "f40f7d9e-2f0d-4167-b250-899273f46874",
+            shadowUUID = "68c86eb7-eb7e-4b4d-96ae-cf7cd847c5b0",
+            primaryUUID = "07b9cc25-2a1f-4a26-a0ec-f2fab578d8bd",
+            timeOffset = 124,
+        },
+        PlotCoinCollect = {
+            remote = "07205405-20ce-4948-b0dd-36b680f698e9",
+            shadowUUID = "0fca7b2e-7e6b-40c5-bb10-4469a82a9ab3",
+            primaryUUID = "0fca7b2e-7e6b-40c5-bb10-4469a82a9ab3",
+            timeOffset = 0,
+        },
+    }
+    _S.BAN_REMOTE_UUID = "92e5a494-0ab4-4c4e-ae6b-96e5f4a2a698"
+    _S.FLAG_REMOTE_PATH = "RE/InventoryService/Sort"
+end
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- NET MODULE PROXY — Game's own Net module for remote resolution
+-- require(Net module) is SAFE and does NOT trigger anticheat.
+-- The game's resolver handles HMAC-SHA256 hashing internally.
+
+
+-- ═══════════════════════════════════════════════════════════════
+if not _S.Net then
+    do
+        local _GameNet = nil   -- The game's Net module (RemoteEvent/RemoteFunction/etc.)
+        local _NetFolder = nil -- ReplicatedStorage.Packages.Net (parent of all remotes)
+        local _cache = {}
+
+        local function nLog(...) vLog("[Net]", ...) end
+
+        local function isHash(str)
+            return type(str) == "string" and #str == 64 and str:match("^%x+$") ~= nil
+        end
+
+        local function isUUID(str)
+            return type(str) == "string" and str:match("^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$") ~= nil
+        end
+
+        -- ── Require the game's own Net module (safe, no AC trigger) ──
+        pcall(function()
+            local Packages = RS:FindFirstChild("Packages")
+            if not Packages then return end
+            _NetFolder = Packages:FindFirstChild("Net")
+            if not _NetFolder then return end
+            local modScript = _NetFolder:FindFirstChildWhichIsA("ModuleScript", true)
+            if modScript then
+                local ok, mod = pcall(require, modScript)
+                if ok and mod then _GameNet = mod end
+            end
+        end)
+
+        if _GameNet then
+            nLog("✓ Game Net module loaded")
+        else
+            nLog("⚠ Game Net module NOT loaded — direct folder lookup only")
+        end
+
+        -- ── Resolve a remote by path using game's resolver + folder fallback ──
+        local function resolveRemote(resolverName, prefix, path)
+            local ck = prefix .. path
+            if _cache[ck] then
+                local ok, p = pcall(function() return _cache[ck].Parent end)
+                if ok and p then return _cache[ck] end
+                _cache[ck] = nil
+            end
+            local inst = nil
+            -- Strategy 1: Game resolver (handles HMAC internally) — names + UUIDs
+            if _GameNet and not isHash(path) then
+                local resolver = _GameNet[resolverName]
+                if resolver then
+                    local ok, r = pcall(resolver, _GameNet, path)
+                    if ok and r then inst = r end
+                end
+            end
+            -- Strategy 2: Direct folder child lookup (hashes, UUIDs, readable)
+            if not inst and _NetFolder then
+                pcall(function() inst = _NetFolder:FindFirstChild(ck) end)
+                if not inst then pcall(function() inst = _NetFolder:FindFirstChild(path) end) end
+            end
+            if inst then
+                _cache[ck] = inst
+                vLog(string.format("[Net] ✓ Resolved %s%s → %s", prefix, path, tostring(inst)))
+            else
+                vLog(string.format("[Net] ✗ Failed to resolve %s%s", prefix, path))
+            end
+            return inst
+        end
+
+        -- ══════════════ Net API ══════════════
+
+        local NetAPI = {}
+
+        function NetAPI:RE(path) return resolveRemote("RemoteEvent", "RE/", path) end
+        function NetAPI:RF(path) return resolveRemote("RemoteFunction", "RF/", path) end
+        function NetAPI:URE(path) return resolveRemote("UnreliableRemoteEvent", "URE/", path) end
+        function NetAPI:RemoteEvent(path) return self:RE(path) end
+        function NetAPI:RemoteFunction(path) return self:RF(path) end
+        function NetAPI:UnreliableRemoteEvent(path) return self:URE(path) end
+
+        function NetAPI:UUID(uuid)
+            local ck = "UUID:" .. uuid
+            if _cache[ck] then
+                local ok, p = pcall(function() return _cache[ck].Parent end)
+                if ok and p then return _cache[ck] end
+                _cache[ck] = nil
+            end
+            if _NetFolder then
+                for _, pfx in ipairs({"RE/", "RF/", "URE/", ""}) do
+                    local inst; pcall(function() inst = _NetFolder:FindFirstChild(pfx .. uuid) end)
+                    if inst then _cache[ck] = inst; return inst end
+                end
+            end
+            return nil
+        end
+
+        function NetAPI:Fire(path, ...)
+            local r = self:RE(path)
+            if not r then nLog("✗ Fire — RE not found: " .. tostring(path)); return false end
+            local ok, err = pcall(r.FireServer, r, ...)
+            if not ok then nLog("✗ Fire error: " .. tostring(err)); return false end
+            return true
+        end
+
+        function NetAPI:Invoke(path, ...)
+            -- Use game's Invoke for names + UUIDs (does resolution + invocation)
+            if _GameNet and _GameNet.Invoke and not isHash(path) then
+                local ok, res = pcall(_GameNet.Invoke, _GameNet, path, ...)
+                if ok then return res end
+            end
+            local r = self:RF(path)
+            if not r then nLog("✗ Invoke — RF not found: " .. tostring(path)); return nil end
+            local ok, res = pcall(r.InvokeServer, r, ...)
+            return ok and res or nil
+        end
+
+        function NetAPI:Listen(path, callback)
+            -- Use game's Connect for names + UUIDs (does resolution + connection)
+            if _GameNet and _GameNet.Connect and not isHash(path) then
+                local ok, conn = pcall(_GameNet.Connect, _GameNet, path, callback)
+                if ok and conn then return conn end
+            end
+            local r = self:RE(path)
+            if not r then nLog("✗ Listen — RE not found: " .. tostring(path)); return nil end
+            local ok, conn = pcall(function() return r.OnClientEvent:Connect(callback) end)
+            return ok and conn or nil
+        end
+
+        function NetAPI:DualFire(systemName, ...)
+            local dfMap = _S.DUAL_FIRE_MAP
+            if not dfMap or not dfMap[systemName] then return false end
+            local info = dfMap[systemName]
+            local remote = self:UUID(info.remote)
+            if not remote then return false end
+            -- Guard: remote may have been destroyed since resolution
+            if not remote.Parent then nLog("✗ DualFire — remote destroyed: " .. tostring(info.remote)); return false end
+            local ok, now = pcall(function() return workspace:GetServerTimeNow() end)
+            if not ok then now = tick() end
+            local args = {...}
+            pcall(remote.FireServer, remote, now + info.timeOffset, info.shadowUUID, unpack(args))
+            pcall(remote.FireServer, remote, now + info.timeOffset, info.primaryUUID, unpack(args))
+            return true
+        end
+
+        function NetAPI:ClearCache() _cache = {} end
+        function NetAPI:GetNetFolder() return _NetFolder end
+        function NetAPI:GetGameNet() return _GameNet end
+
+        function NetAPI:DumpAll()
+            local results = {}
+            if not _NetFolder then return results end
+            pcall(function()
+                for _, child in ipairs(_NetFolder:GetChildren()) do
+                    pcall(function()
+                        if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") or child:IsA("UnreliableRemoteEvent") then
+                            local rawName = child.Name
+                            local prefix, body = "", rawName
+                            if rawName:sub(1, 4) == "URE/" then
+                                prefix = "URE/"; body = rawName:sub(5)
+                            elseif rawName:sub(1, 3) == "RE/" or rawName:sub(1, 3) == "RF/" then
+                                prefix = rawName:sub(1, 3); body = rawName:sub(4)
+                            end
+                            results[#results + 1] = {
+                                raw = rawName, prefix = prefix, body = body,
+                                className = child.ClassName, isHex = isHash(body), instance = child,
+                            }
+                        end
+                    end)
+                end
+            end)
+            return results
+        end
+
+        function NetAPI:DiagReport()
+            local dump = self:DumpAll()
+            local hexCount, plainCount = 0, 0
+            for _, r in ipairs(dump) do
+                if r.isHex then hexCount = hexCount + 1 else plainCount = plainCount + 1 end
+            end
+            warn(string.format(
+                "[Net Diag] GameNet=%s | Folder=%s | Total=%d | Hex=%d | Plain=%d",
+                _GameNet and "LOADED" or "MISSING",
+                _NetFolder and "FOUND" or "MISSING",
+                #dump, hexCount, plainCount
+            ))
+            return { gameNetLoaded = _GameNet ~= nil, folderFound = _NetFolder ~= nil,
+                total = #dump, hex = hexCount, plain = plainCount, remotes = dump }
+        end
+
+        function NetAPI:Exists(remoteType, path)
+            local m = ({RE = self.RE, RF = self.RF, URE = self.URE})[remoteType:upper()]
+            return m and m(self, path) ~= nil or false
+        end
+
+        function NetAPI:Verify()
+            local pass = 0
+            for _, name in ipairs({"PlotService/Sell", "PlotService/Open", "InventoryService/Sort"}) do
+                if self:RE(name) then pass = pass + 1 end
+            end
+            return pass >= 1
+        end
+
+        _S.Net = NetAPI
+    end
+end
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- SYNCWRAPPER — Direct channel access without v_u_9() detection
+
+
+-- ═══════════════════════════════════════════════════════════════
+if not _S.SyncWrapper then
+    pcall(function()
+        local Packages = RS:WaitForChild("Packages", 30)
+        if not Packages then return end
+        local SyncMod = Packages:FindFirstChild("Synchronizer")
+        if not SyncMod then return end
+        local ok, OrigSync = pcall(require, SyncMod)
+        if not ok or not OrigSync or not OrigSync.GetAllChannels then return end
+        local ok2, channels = pcall(function() return OrigSync:GetAllChannels() end)
+        if not ok2 or type(channels) ~= "table" then return end
+
+        local SW = {}
+        function SW:GetAllChannels() return channels end
+        function SW:Get(idx) return idx and channels[idx] or nil end
+        function SW:GetTableFromChannel(idx)
+            local ch = channels[idx]
+            return ch and ch.GetTable and ch:GetTable() or nil
+        end
+        function SW:Wait(idx)
+            if not idx then return nil end
+            if channels[idx] then return channels[idx] end
+            if not OrigSync.OnChannelCreated then return nil end
+            local thread = coroutine.running()
+            local conn, timedOut
+            conn = OrigSync.OnChannelCreated:Connect(function(ch)
+                if timedOut then return end
+                if ch:GetIndex() == idx then conn:Disconnect(); task.spawn(thread, ch) end
+            end)
+            task.delay(10, function()
+                if conn.Connected then timedOut = true; conn:Disconnect(); task.spawn(thread, nil) end
+            end)
+            return coroutine.yield()
+        end
+        SW.OnChannelCreated = OrigSync.OnChannelCreated
+        SW.OnChannelDestroyed = OrigSync.OnChannelDestroyed
+        _S.SyncWrapper = SW
+        _S.SYNC_READY = true
+    end)
+end
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- __ASTRO_LIB — Shared null-safe helper library (loaded ONCE)
+-- All helpers assume nothing is alive. No null shall pass.
+-- Scripts use: local L = getgenv().__ASTRO_LIB
+
+
+-- ═══════════════════════════════════════════════════════════════
+if not getgenv().__ASTRO_LIB then
+    local Players = game:GetService("Players")
+    local RunService = game:GetService("RunService")
+    local LP = Players.LocalPlayer
+    local lib = {}
+
+    -- ── Instance validity ──
+    -- Returns true only if inst exists AND has a parent (not destroyed)
+    function lib.alive(inst)
+        if not inst then return false end
+        local ok, p = pcall(function() return inst.Parent end)
+        return ok and p ~= nil
+    end
+
+    -- ── Safe character getter ──
+    function lib.getChar(player)
+        player = player or LP
+        if not player then return nil end
+        local c = player.Character
+        if not c or not c.Parent then return nil end
+        return c
+    end
+
+    -- ── Safe HumanoidRootPart getter ──
+    function lib.getHRP(player)
+        local c = lib.getChar(player)
+        if not c then return nil end
+        local h = c:FindFirstChild("HumanoidRootPart")
+        return (h and h.Parent) and h or nil
+    end
+
+    -- ── Safe Humanoid getter ──
+    function lib.getHum(player)
+        local c = lib.getChar(player)
+        if not c then return nil end
+        local h = c:FindFirstChildOfClass("Humanoid")
+        return (h and h.Parent) and h or nil
+    end
+
+    -- ── Safe Position read (returns nil instead of crashing) ──
+    function lib.getPos(inst)
+        if not inst then return nil end
+        local ok, pos = pcall(function() return inst.Position end)
+        return ok and pos or nil
+    end
+
+    -- ── Safe CFrame read ──
+    function lib.getCF(inst)
+        if not inst then return nil end
+        local ok, cf = pcall(function() return inst.CFrame end)
+        return ok and cf or nil
+    end
+
+    -- ── Safe distance between two instances (returns math.huge on failure) ──
+    function lib.dist(a, b)
+        local pa, pb = lib.getPos(a), lib.getPos(b)
+        if not pa or not pb then return math.huge end
+        return (pa - pb).Magnitude
+    end
+
+    -- ── Safe FindFirstChild (nil parent = nil result) ──
+    function lib.find(parent, name)
+        if not parent then return nil end
+        local ok, child = pcall(parent.FindFirstChild, parent, name)
+        return (ok and child) and child or nil
+    end
+
+    -- ── Safe FindFirstChildOfClass ──
+    function lib.findClass(parent, className)
+        if not parent then return nil end
+        local ok, child = pcall(parent.FindFirstChildOfClass, parent, className)
+        return (ok and child) and child or nil
+    end
+
+    -- ── Safe tostring (prevents null-string crash from tostring on destroyed instances) ──
+    function lib.str(v)
+        if v == nil then return "nil" end
+        local ok, s = pcall(tostring, v)
+        return ok and s or "<invalid>"
+    end
+
+    -- ── Safe string concat for display names (crash RDX=0x0 at cmp [rdx+0x18]) ──
+    function lib.displayName(player)
+        if not player then return "Unknown" end
+        local ok, dn = pcall(function() return player.DisplayName end)
+        if not ok or not dn or dn == "" then
+            local ok2, n = pcall(function() return player.Name end)
+            return (ok2 and n and n ~= "") and n or "Unknown"
+        end
+        return dn
+    end
+
+    -- ── Iterate all players safely, skip LocalPlayer, skip nil characters ──
+    -- callback(player, character, hrp) — only called when all 3 are valid
+    function lib.forEachPlayer(callback, includeLocal)
+        for _, player in Players:GetPlayers() do
+            if not includeLocal and player == LP then continue end
+            local char = player.Character
+            if not char or not char.Parent then continue end
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp and hrp.Parent then
+                local ok, err = pcall(callback, player, char, hrp)
+            end
+        end
+    end
+
+    -- ── Find closest other player within range ──
+    function lib.closestPlayer(position, maxRange)
+        maxRange = maxRange or 100
+        local closest, bestDist = nil, maxRange
+        lib.forEachPlayer(function(player, char, hrp)
+            local d = (hrp.Position - position).Magnitude
+            if d < bestDist then
+                closest = player
+                bestDist = d
+            end
+        end)
+        return closest, bestDist
+    end
+
+    -- ── Find tool equipped by a player (safe) ──
+    function lib.getTool(player)
+        local char = lib.getChar(player)
+        if not char then return nil end
+        return char:FindFirstChildOfClass("Tool")
+    end
+
+    -- ── Protected Heartbeat wrapper (crash in callback won't kill the connection) ──
+    function lib.safeHeartbeat(fn)
+        return RunService.Heartbeat:Connect(function(dt)
+            local ok, err = pcall(fn, dt)
+        end)
+    end
+
+    -- ── Protected RenderStepped wrapper ──
+    function lib.safeRenderStep(fn)
+        return RunService.RenderStepped:Connect(function(dt)
+            local ok, err = pcall(fn, dt)
+        end)
+    end
+
+    -- ── Protected infinite loop (never dies from errors, respects interval) ──
+    function lib.safeLoop(fn, interval)
+        task.spawn(function()
+            while true do
+                local ok, err = pcall(fn)
+                task.wait(interval or 1)
+            end
+        end)
+    end
+
+    -- ── SAB Place ID set (shared reference) ──
+    lib.SAB_PLACE_IDS = {[109983668079237]=true,[85621847059032]=true,[99606176102979]=true}
+
+    -- ── Teleport safety check (stop loops when game changes) ──
+    function lib.isSABPlace()
+        return lib.SAB_PLACE_IDS[game.PlaceId] == true
+    end
+
+    getgenv().__ASTRO_LIB = lib
+end
+
+-- Mark container as fully initialized for fast-path
+_S._CONTAINER_READY = true
+end -- CONTAINER INIT GUARD
+
+
+-- ═══════════════════════════════════════════════════════════════
+-- EXPORTS — These locals are available to the rest of the script
+
+
+-- ═══════════════════════════════════════════════════════════════
+local SAB_PLACE_IDS = getgenv().__ASTRO_LIB and getgenv().__ASTRO_LIB.SAB_PLACE_IDS or {[109983668079237]=true,[85621847059032]=true,[99606176102979]=true}
+local ASTRO_STATE = _S
+local Net = _S.Net
+local Synchronizer = _S.SyncWrapper
+local SyncWrapper = Synchronizer
+local L = getgenv().__ASTRO_LIB
+
+-- Auto-run diagnostics on first load
+if not _S.DIAG_RUN and Net then
+    pcall(function()
+        task.defer(function()
+            task.wait(3)
+            Net:DiagReport()
+            _S.DIAG_RUN = true
+        end)
+    end)
+end
+
+
+-- ╚═══ END SAB ANTICHEAT CONTAINER v3 ═══╝
+
+
+
+--[[
+    =====================================================
+    🎭 TROLL SCRAMBLER — Standalone
+    =====================================================
+    Replaces other players' brainrots with random ones
+    (client-side only, visual troll).
+    Single 🎭 icon → collapsible settings panel.
+    ICON SLOT: Right side, Y=180 (🎭 = troll scrambler)
+    =====================================================
+]]
+task.wait(1)
+
+-- ============================================================================
+-- SERVICES
+
+-- ============================================================================
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    repeat task.wait() until Players.LocalPlayer
+    LocalPlayer = Players.LocalPlayer
+end
+
+-- ============================================================================
+-- GAME MODULES
+
+-- ============================================================================
+local Packages = ReplicatedStorage:WaitForChild("Packages", 10)
+local Datas = ReplicatedStorage:WaitForChild("Datas", 10)
+if not Packages or not Datas then
+    warn("[TrollScrambler] Required modules not found!")
+    return
+end
+local _RawSync2 = require(Packages.Synchronizer)
+local _channels2 = _RawSync2:GetAllChannels()
+local AnimalsData = require(Datas.Animals)
+local MutationsData = require(Datas.Mutations)
+local TraitsData = require(Datas.Traits)
+local RaritiesData = require(Datas.Rarities)
+print("[TrollScrambler] Modules loaded!")
+
+-- ============================================================================
+-- CONFIG SAVE/LOAD
+
+-- ============================================================================
+local CONFIG_PATH = "astroconfig/troll_scrambler.json"
+local Config = {
+    iconPosition = { x = -48, y = 180 }, -- icon position offsets (x from right edge)
+    panelPosition = nil, -- {x = absX, y = absY} — nil = center of screen
+    panelOpen = false,
+}
+local function ensureConfigFolder()
+    pcall(function()
+        if not isfolder("astroconfig") then makefolder("astroconfig") end
+    end)
+end
+local function saveConfig()
+    ensureConfigFolder()
+    pcall(function()
+        writefile(CONFIG_PATH, HttpService:JSONEncode(Config))
+    end)
+end
+local function loadConfig()
+    pcall(function()
+        if isfile(CONFIG_PATH) then
+            local loaded = HttpService:JSONDecode(readfile(CONFIG_PATH))
+            if loaded.iconPosition then Config.iconPosition = loaded.iconPosition end
+            if loaded.panelPosition then Config.panelPosition = loaded.panelPosition end
+            if loaded.panelOpen ~= nil then Config.panelOpen = loaded.panelOpen end
+        end
+    end)
+end
+loadConfig()
+
+-- ============================================================================
+-- UI HELPERS
+
+-- ============================================================================
+local function createCorner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 6)
+    c.Parent = parent
+    return c
+end
+local function createStroke(parent, color, thickness)
+    local s = Instance.new("UIStroke")
+    s.Color = color or Color3.fromRGB(255, 255, 255)
+    s.Thickness = thickness or 1
+    s.Parent = parent
+    return s
+end
+
+-- ============================================================================
+-- PLOT HELPERS
+
+-- ============================================================================
+local function getMyPlot()
+    local plots = workspace:FindFirstChild("Plots")
+    if not plots then return nil end
+    for _, plot in ipairs(plots:GetChildren()) do
+        local plotSign = plot:FindFirstChild("PlotSign")
+        if plotSign then
+            local yourBase = plotSign:FindFirstChild("YourBase")
+            if yourBase and yourBase:IsA("BillboardGui") and yourBase.Enabled then
+                return plot
+            end
+        end
+    end
+    for _, plot in ipairs(plots:GetChildren()) do
+        if plot:GetAttribute("Owner") == LocalPlayer.Name then return plot end
+    end
+    return nil
+end
+
+-- ============================================================================
+-- RARITY DATA & SETTINGS (Dynamically built from game data!)
+
+-- ============================================================================
+-- Default weight fallbacks (used when game doesn't provide weights)
+local DEFAULT_RARITY_WEIGHTS = {
+    Common = 1000, Rare = 500, Epic = 200, Legendary = 80, Mythic = 30,
+    ["Brainrot God"] = 10, Secret = 4, OG = 0.001, Admin = 0.1,
+}
+-- Discover ALL rarities from the game's AnimalsData module + RaritiesData
+local RARITY_ORDER = {}
+local raritySet = {}
+-- First add from RaritiesData (game's rarity definitions)
+if RaritiesData then
+    for rarName, rarInfo in pairs(RaritiesData) do
+        if not raritySet[rarName] then
+            raritySet[rarName] = true
+            table.insert(RARITY_ORDER, rarName)
+        end
+    end
+end
+-- Then discover any extra rarities from animals themselves
+for _, animalInfo in pairs(AnimalsData) do
+    local r = animalInfo.Rarity or "Common"
+    if not raritySet[r] then
+        raritySet[r] = true
+        table.insert(RARITY_ORDER, r)
+    end
+end
+-- Build weights: try game data first, then defaults, then generic fallback
+-- OG ALWAYS uses hardcoded weight (game data is wrong for it)
+local FORCED_WEIGHTS = {
+    OG = 0.001,
+}
+local RARITY_WEIGHTS = {}
+for _, r in ipairs(RARITY_ORDER) do
+    if FORCED_WEIGHTS[r] then
+        RARITY_WEIGHTS[r] = FORCED_WEIGHTS[r]
+    else
+        -- Try to get weight from game's RaritiesData (Weight or Chance field)
+        local gameWeight = nil
+        if RaritiesData and RaritiesData[r] then
+            gameWeight = RaritiesData[r].Weight or RaritiesData[r].Chance or RaritiesData[r].SpawnWeight
+        end
+        RARITY_WEIGHTS[r] = gameWeight or DEFAULT_RARITY_WEIGHTS[r] or 15 -- 15 = event rarity default
+    end
+end
+-- Custom display order: main rarities first, then everything else at the bottom
+local DISPLAY_ORDER = {"Common","Mythic","Rare","Legendary","Brainrot God","Secret","OG"}
+local displayRank = {}
+for i, name in ipairs(DISPLAY_ORDER) do displayRank[name] = i end
+table.sort(RARITY_ORDER, function(a, b)
+    local ra = displayRank[a] or (1000)
+    local rb = displayRank[b] or (1000)
+    if ra ~= rb then return ra < rb end
+    return a < b -- alphabetical tiebreak for unlisted rarities
+end)
+print("[TrollScrambler] Discovered " .. #RARITY_ORDER .. " rarities: " .. table.concat(RARITY_ORDER, ", "))
+-- Build colors from game data first, then fallback
+local RARITY_COLORS = {}
+for _, r in ipairs(RARITY_ORDER) do
+    if RaritiesData and RaritiesData[r] and RaritiesData[r].MainColor then
+        RARITY_COLORS[r] = RaritiesData[r].MainColor
+    else
+        RARITY_COLORS[r] = Color3.fromRGB(180, 180, 180) -- Default grey
+    end
+end
+local trollSettings = {
+    enabledRarities = {},
+    spawnChance = 100,
+    emptyPodiumChance = 20,
+    randomMutation = true,
+    randomTraits = true,
+    minTraits = 0,
+    maxTraits = 5,
+}
+for _, r in ipairs(RARITY_ORDER) do trollSettings.enabledRarities[r] = true end
+-- Build per-rarity animal lists
+local ANIMALS_BY_RARITY = {}
+for _, r in ipairs(RARITY_ORDER) do ANIMALS_BY_RARITY[r] = {} end
+for name, data in pairs(AnimalsData) do
+    local r = data.Rarity or "Common"
+    if not ANIMALS_BY_RARITY[r] then ANIMALS_BY_RARITY[r] = {} end
+    table.insert(ANIMALS_BY_RARITY[r], name)
+end
+
+-- ============================================================================
+-- SCRAMBLE LOGIC
+
+-- ============================================================================
+local function pickWeightedAnimal()
+    local pool = {}
+    local totalWeight = 0
+    for _, r in ipairs(RARITY_ORDER) do
+        if trollSettings.enabledRarities[r] and ANIMALS_BY_RARITY[r] and #ANIMALS_BY_RARITY[r] > 0 then
+            local w = RARITY_WEIGHTS[r] or 10
+            totalWeight = totalWeight + w
+            table.insert(pool, {rarity = r, weight = w})
+        end
+    end
+    if totalWeight == 0 then return nil end
+    local roll = math.random() * totalWeight
+    local acc = 0
+    local chosenRarity = pool[1].rarity
+    for _, entry in ipairs(pool) do
+        acc = acc + entry.weight
+        if roll <= acc then chosenRarity = entry.rarity; break end
+    end
+    local animals = ANIMALS_BY_RARITY[chosenRarity]
+    return animals[math.random(1, #animals)]
+end
+local function getRandomTraits(count)
+    local all = {}
+    if TraitsData then
+        for t, _ in pairs(TraitsData) do
+            if t ~= "Sleepy" then table.insert(all, t) end
+        end
+    end
+    local picked = {}
+    for i = #all, 2, -1 do
+        local j = math.random(1, i)
+        all[i], all[j] = all[j], all[i]
+    end
+    for i = 1, math.min(count, #all) do
+        table.insert(picked, all[i])
+    end
+    return picked
+end
+local function getRandomMutation()
+    local muts = {"Default"}
+    if MutationsData then
+        for m, _ in pairs(MutationsData) do table.insert(muts, m) end
+    end
+    return muts[math.random(1, #muts)]
+end
+local function buildChannelMap()
+    local map = {}
+    local rawChannels = nil
+    pcall(function() rawChannels = _RawSync2:GetAllChannels() end)
+    if not rawChannels then
+        print("[TrollScrambler] GetAllChannels() returned nil!")
+        return map
+    end
+    local count = 0
+    for key, ch in pairs(rawChannels) do
+        count = count + 1
+        local idx = nil
+        pcall(function()
+            if type(ch) == "table" or type(ch) == "userdata" then
+                idx = ch:GetIndex()
+            end
+        end)
+        local mapKey = idx or key
+        if type(mapKey) == "string" then map[mapKey] = ch end
+        if type(key) == "string" and key ~= mapKey then map[key] = ch end
+    end
+    print("[TrollScrambler] Channel map: " .. count .. " raw -> " .. (function() local n=0; for _ in pairs(map) do n=n+1 end; return n end)() .. " mapped")
+    return map
+end
+local trollScrambling = false
+-- Backup storage: plotName -> { [podiumIdx] = originalData }
+local backupData = {}
+local hasBackup = false
+
+-- ====== CROSS-SCRIPT TROLL REGISTRY ======
+-- Global registry so other scripts know which plots have fake data
+if not getgenv().__TROLL_SCRAMBLED_PLOTS then
+    getgenv().__TROLL_SCRAMBLED_PLOTS = {}
+end
+local scrambledPlots = getgenv().__TROLL_SCRAMBLED_PLOTS
+-- Expose troll data in _G for cross-script access (Index V2, Highest ESP, etc.)
+_G.TrollScrambler = _G.TrollScrambler or {}
+_G.TrollScrambler.isScrambled = function(plotName)
+    return scrambledPlots[plotName] == true
+end
+_G.TrollScrambler.getScrambledPlots = function()
+    return scrambledPlots
+end
+_G.TrollScrambler.getBackupData = function()
+    return backupData
+end
+_G.TrollScrambler.hasBackup = function()
+    return hasBackup
+end
+-- Helper: Check if a plot has a real player owner currently in-game
+local function plotHasActivePlayer(plotName, channel)
+    -- Method 1: Check channel Owner data
+    if channel then
+        local ownerOk, ownerData = pcall(function() return channel:Get("Owner") end)
+        if ownerOk and ownerData then
+            local ownerName = nil
+            if typeof(ownerData) == "Instance" and ownerData:IsA("Player") then
+                ownerName = ownerData.Name
+            elseif type(ownerData) == "table" and ownerData.Name then
+                ownerName = ownerData.Name
+            elseif type(ownerData) == "string" and ownerData ~= "" then
+                ownerName = ownerData
+            end
+            if ownerName then
+                -- Check if this player is actually in the server
+                local player = Players:FindFirstChild(ownerName)
+                if player then return true end
+            end
+        end
+    end
+    -- Method 2: Check plot's Owner attribute
+    local plotObj = workspace:FindFirstChild("Plots") and workspace.Plots:FindFirstChild(plotName)
+    if plotObj then
+        local attrOwner = plotObj:GetAttribute("Owner")
+        if attrOwner and attrOwner ~= "" then
+            local player = Players:FindFirstChild(attrOwner)
+            if player then return true end
+        end
+    end
+    return false
+end
+local function trollScramblePlots()
+    if trollScrambling then return 0, 0 end
+    trollScrambling = true
+    local plots = workspace:FindFirstChild("Plots")
+    if not plots then
+        print("[TrollScrambler] No Plots folder!")
+        trollScrambling = false
+        return 0, 0
+    end
+    local myPlot = getMyPlot()
+    local myPlotName = myPlot and myPlot.Name or ""
+    print("[TrollScrambler] My plot: " .. myPlotName)
+    local channelMap = buildChannelMap()
+    -- Fallback: cached channels
+    if _channels2 then
+        for key, ch in pairs(_channels2) do
+            local idx = nil
+            pcall(function() idx = ch:GetIndex() end)
+            local mapKey = idx or key
+            if type(mapKey) == "string" and not channelMap[mapKey] then channelMap[mapKey] = ch end
+            if type(key) == "string" and not channelMap[key] then channelMap[key] = ch end
+        end
+    end
+    local totalSpawned, totalSkipped, plotCount = 0, 0, 0
+    local plotChildren = plots:GetChildren()
+    print("[TrollScrambler] " .. #plotChildren .. " plot objects")
+    for _, plot in ipairs(plotChildren) do
+        if plot.Name ~= myPlotName then
+            local channel = channelMap[plot.Name]
+            if not channel then pcall(function() channel = _RawSync2:GetAllChannels()[plot.Name] end) end
+            if not channel then pcall(function() channel = _channels2[plot.Name] end) end
+            if channel then
+                -- Skip plots without an active player (empty/unowned plots)
+                if not plotHasActivePlayer(plot.Name, channel) then
+                    print("[TrollScrambler] Skipping " .. plot.Name .. " (no active player)")
+                else
+                local podiumSet = {}
+                local folder = plot:FindFirstChild("AnimalPodiums") or plot:FindFirstChild("Podiums")
+                if folder then
+                    for _, child in ipairs(folder:GetChildren()) do
+                        local num = tonumber(child.Name)
+                        if num then podiumSet[num] = true end
+                    end
+                end
+                for i = 1, 10 do
+                    local ok, data = pcall(function() return channel:Get("AnimalList." .. i) end)
+                    if ok and data and type(data) == "table" then podiumSet[i] = true end
+                end
+                local podiums = {}
+                for idx in pairs(podiumSet) do table.insert(podiums, idx) end
+                table.sort(podiums)
+                if #podiums > 0 then
+                    plotCount = plotCount + 1
+                    -- Backup original data for this plot before scrambling
+                    if not backupData[plot.Name] then
+                        backupData[plot.Name] = {}
+                        for _, podIdx in ipairs(podiums) do
+                            local ok, origData = pcall(function() return channel:Get("AnimalList." .. podIdx) end)
+                            if ok then
+                                backupData[plot.Name][podIdx] = origData
+                            end
+                        end
+                    end
+                    for _, podIdx in ipairs(podiums) do
+                        if math.random(1, 100) > trollSettings.spawnChance then
+                            totalSkipped = totalSkipped + 1
+                        elseif trollSettings.emptyPodiumChance > 0 and math.random(1, 100) <= trollSettings.emptyPodiumChance then
+                            pcall(function() channel:Set("AnimalList." .. podIdx, "Empty") end)
+                            totalSkipped = totalSkipped + 1
+                        else
+                            local animal = pickWeightedAnimal()
+                            if animal then
+                                local mut = trollSettings.randomMutation and getRandomMutation() or "Default"
+                                -- Weighted trait count
+                                local traitCount = 0
+                                if trollSettings.randomTraits then
+                                    local roll = math.random(1, 100)
+                                    if roll <= 30 then traitCount = 0
+                                    elseif roll <= 55 then traitCount = 1
+                                    elseif roll <= 75 then traitCount = 2
+                                    elseif roll <= 88 then traitCount = 3
+                                    elseif roll <= 96 then traitCount = 4
+                                    else traitCount = 5 end
+                                    traitCount = math.clamp(traitCount, trollSettings.minTraits, trollSettings.maxTraits)
+                                end
+                                local traits = traitCount > 0 and getRandomTraits(traitCount) or nil
+                                local data = {
+                                    Index = animal,
+                                    Mutation = (mut ~= "Default" and mut ~= "Normal") and mut or nil,
+                                    Traits = traits and #traits > 0 and traits or nil,
+                                    LastCollect = workspace:GetServerTimeNow()
+                                }
+                                local ok, err = pcall(function() channel:Set("AnimalList." .. podIdx, data) end)
+                                if ok then
+                                    totalSpawned = totalSpawned + 1
+                                else
+                                    print("[TrollScrambler] Set FAILED " .. plot.Name .. " #" .. podIdx .. ": " .. tostring(err))
+                                end
+                            end
+                        end
+                    end
+                end
+                end -- end else (active player check)
+            end
+        end
+    end
+    print("[TrollScrambler] Done: " .. totalSpawned .. " spawned, " .. totalSkipped .. " skipped, " .. plotCount .. " plots")
+    -- Mark scrambled plots in global registry
+    for plotName, _ in pairs(backupData) do
+        scrambledPlots[plotName] = true
+    end
+    hasBackup = true
+    trollScrambling = false
+    return totalSpawned, plotCount
+end
+
+-- ============================================================================
+-- RESTORE FUNCTION — Reverse scramble using backed up data
+
+-- ============================================================================
+local function restoreScrambledPlots()
+    if trollScrambling then return 0 end
+    if not hasBackup or not next(backupData) then
+        print("[TrollScrambler] No backup data to restore!")
+        return 0
+    end
+    trollScrambling = true
+    local channelMap = buildChannelMap()
+    if _channels2 then
+        for key, ch in pairs(_channels2) do
+            local idx = nil
+            pcall(function() idx = ch:GetIndex() end)
+            local mapKey = idx or key
+            if type(mapKey) == "string" and not channelMap[mapKey] then channelMap[mapKey] = ch end
+            if type(key) == "string" and not channelMap[key] then channelMap[key] = ch end
+        end
+    end
+    local restored, failed = 0, 0
+    for plotName, podiums in pairs(backupData) do
+        local channel = channelMap[plotName]
+        if not channel then pcall(function() channel = _RawSync2:GetAllChannels()[plotName] end) end
+        if not channel then pcall(function() channel = _channels2[plotName] end) end
+        if channel then
+            for podIdx, origData in pairs(podiums) do
+                -- If original was nil/empty, set to "Empty" string (game format for empty podiums)
+                local dataToRestore = origData
+                if dataToRestore == nil then dataToRestore = "Empty" end
+                local ok, err = pcall(function() channel:Set("AnimalList." .. podIdx, dataToRestore) end)
+                if ok then
+                    restored = restored + 1
+                    print("[TrollScrambler] Restored " .. plotName .. " #" .. podIdx)
+                else
+                    failed = failed + 1
+                    print("[TrollScrambler] FAILED restore " .. plotName .. " #" .. podIdx .. ": " .. tostring(err))
+                end
+            end
+            -- Remove from fake registry
+            scrambledPlots[plotName] = nil
+        else
+            print("[TrollScrambler] No channel found for " .. plotName .. " during restore!")
+            failed = failed + 1
+        end
+    end
+    backupData = {}
+    hasBackup = false
+    print("[TrollScrambler] Restored " .. restored .. " podiums! (" .. failed .. " failed)")
+    trollScrambling = false
+    return restored
+end
+
+-- ============================================================================
+-- GUI: ICON BUTTON + COLLAPSIBLE PANEL
+
+-- ============================================================================
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+-- Destroy old instance
+local old = playerGui:FindFirstChild("TrollScramblerGUI")
+if old then old:Destroy() end
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "TrollScramblerGUI"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.DisplayOrder = 998
+screenGui.Parent = playerGui
+
+-- ====== FLOATING ICON BUTTON ======
+local iconBtn = Instance.new("TextButton")
+iconBtn.Name = "TrollIcon"
+iconBtn.Size = UDim2.new(0, 38, 0, 38)
+do
+    local cam = workspace.CurrentCamera
+    local vw = cam and cam.ViewportSize.X or 1920
+    local defaultX = vw - 48
+    local defaultY = 180
+    local ix = Config.iconPosition.x
+    local iy = Config.iconPosition.y
+    -- If saved position looks like old Scale=1 offset (negative), convert to absolute
+    if ix and ix < 0 then ix = vw + ix end
+    iconBtn.Position = UDim2.new(0, ix or defaultX, 0, iy or defaultY)
+end
+iconBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+iconBtn.BorderSizePixel = 0
+iconBtn.Text = "🎭"
+iconBtn.TextSize = 20
+iconBtn.TextColor3 = Color3.new(1, 1, 1)
+iconBtn.Font = Enum.Font.GothamBold
+iconBtn.ZIndex = 200
+iconBtn.Parent = screenGui
+createCorner(iconBtn, 10)
+createStroke(iconBtn, Color3.fromRGB(255, 100, 100), 2)
+-- Icon dragging
+local iconDragging, iconDragStart, iconStartPos, iconHasDragged = false, nil, nil, false
+iconBtn.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        iconDragging = true; iconDragStart = input.Position; iconStartPos = iconBtn.Position; iconHasDragged = false
+    end
+end)
+iconBtn.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        iconDragging = false
+        if iconHasDragged then
+            -- Clamp to screen bounds
+            local cam = workspace.CurrentCamera
+            local vw = cam and cam.ViewportSize.X or 1920
+            local vh = cam and cam.ViewportSize.Y or 1080
+            local clampedX = math.clamp(iconBtn.Position.X.Offset, 0, vw - 38)
+            local clampedY = math.clamp(iconBtn.Position.Y.Offset, 0, vh - 38)
+            iconBtn.Position = UDim2.new(0, clampedX, 0, clampedY)
+            Config.iconPosition.x = clampedX
+            Config.iconPosition.y = clampedY
+            saveConfig()
+        end
+        iconHasDragged = false -- Reset AFTER saving so click handler can proceed
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if iconDragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - iconDragStart
+        if delta.Magnitude > 5 then iconHasDragged = true end
+        if iconHasDragged then
+            iconBtn.Position = UDim2.new(
+                iconStartPos.X.Scale, iconStartPos.X.Offset + delta.X,
+                iconStartPos.Y.Scale, iconStartPos.Y.Offset + delta.Y
+            )
+        end
+    end
+end)
+
+-- ====== MAIN PANEL (hidden by default) ======
+local panel = Instance.new("Frame")
+panel.Name = "TrollPanel"
+local PANEL_W, PANEL_H = 400, 720
+panel.Size = UDim2.new(0, PANEL_W, 0, PANEL_H)
+do
+    local cam = workspace.CurrentCamera
+    local vw = cam and cam.ViewportSize.X or 1920
+    local vh = cam and cam.ViewportSize.Y or 1080
+    local px, py
+    if Config.panelPosition then
+        px = Config.panelPosition.x
+        py = Config.panelPosition.y
+    else
+        -- Default: center of screen
+        px = math.floor((vw - PANEL_W) / 2)
+        py = math.floor((vh - PANEL_H) / 2)
+    end
+    px = math.clamp(px, 0, vw - PANEL_W)
+    py = math.clamp(py, 0, vh - PANEL_H)
+    panel.Position = UDim2.new(0, px, 0, py)
+end
+panel.AnchorPoint = Vector2.new(0, 0)
+panel.BackgroundColor3 = Color3.fromRGB(20, 15, 15)
+panel.BorderSizePixel = 0
+panel.Visible = false
+panel.ZIndex = 300
+panel.Parent = screenGui
+createCorner(panel, 12)
+createStroke(panel, Color3.fromRGB(255, 80, 80), 3)
+-- Panel dragging (absolute positioning with screen clamp)
+local panelDragging, panelDragStart, panelStartPos = false, nil, nil
+panel.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        panelDragging = true; panelDragStart = input.Position; panelStartPos = panel.Position
+        screenGui.DisplayOrder = 10000
+    end
+end)
+panel.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        panelDragging = false
+        screenGui.DisplayOrder = 998
+        -- Screen clamp
+        local cam = workspace.CurrentCamera
+        local vw = cam and cam.ViewportSize.X or 1920
+        local vh = cam and cam.ViewportSize.Y or 1080
+        local cx = math.clamp(panel.Position.X.Offset, 0, vw - PANEL_W)
+        local cy = math.clamp(panel.Position.Y.Offset, 0, vh - PANEL_H)
+        panel.Position = UDim2.new(0, cx, 0, cy)
+        Config.panelPosition = { x = cx, y = cy }
+        saveConfig()
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if panelDragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        local delta = input.Position - panelDragStart
+        panel.Position = UDim2.new(0,
+            panelStartPos.X.Offset + delta.X,
+            0,
+            panelStartPos.Y.Offset + delta.Y)
+    end
+end)
+
+-- ====== HEADER ======
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 40)
+header.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+header.BorderSizePixel = 0
+header.ZIndex = 301
+header.Parent = panel
+createCorner(header, 12)
+local headerFix = Instance.new("Frame")
+headerFix.Size = UDim2.new(1, 0, 0, 12)
+headerFix.Position = UDim2.new(0, 0, 1, -12)
+headerFix.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+headerFix.BorderSizePixel = 0
+headerFix.ZIndex = 301
+headerFix.Parent = header
+local headerLabel = Instance.new("TextLabel")
+headerLabel.Size = UDim2.new(1, -40, 1, 0)
+headerLabel.BackgroundTransparency = 1
+headerLabel.Text = "🎭 TROLL SCRAMBLER"
+headerLabel.TextColor3 = Color3.new(1, 1, 1)
+headerLabel.TextSize = 16
+headerLabel.Font = Enum.Font.GothamBlack
+headerLabel.ZIndex = 302
+headerLabel.Parent = header
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 30, 0, 30)
+closeBtn.Position = UDim2.new(1, -35, 0.5, 0)
+closeBtn.AnchorPoint = Vector2.new(0, 0.5)
+closeBtn.BackgroundColor3 = Color3.fromRGB(120, 30, 30)
+closeBtn.BorderSizePixel = 0
+closeBtn.Text = ""
+closeBtn.TextColor3 = Color3.new(1, 1, 1)
+closeBtn.TextSize = 18
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.ZIndex = 303
+closeBtn.Parent = header
+createCorner(closeBtn, 6)
+closeBtn.MouseButton1Click:Connect(function()
+    panel.Visible = false
+    iconBtn.Visible = true -- Show icon again when panel closes
+    Config.panelOpen = false
+    saveConfig()
+end)
+
+-- ====== CONTENT ======
+local content = Instance.new("Frame")
+content.Name = "Content"
+content.Size = UDim2.new(1, -16, 1, -52)
+content.Position = UDim2.new(0.5, 0, 0, 46)
+content.AnchorPoint = Vector2.new(0.5, 0)
+content.BackgroundTransparency = 1
+content.ZIndex = 301
+content.Parent = panel
+
+-- ====== SPAWN CHANCE SLIDER ======
+local chanceLabel = Instance.new("TextLabel")
+chanceLabel.Size = UDim2.new(1, 0, 0, 18)
+chanceLabel.Position = UDim2.new(0, 0, 0, 0)
+chanceLabel.BackgroundTransparency = 1
+chanceLabel.Text = "Spawn Chance: " .. trollSettings.spawnChance .. "%"
+chanceLabel.TextColor3 = Color3.new(1, 1, 1)
+chanceLabel.TextSize = 13
+chanceLabel.Font = Enum.Font.GothamBold
+chanceLabel.TextXAlignment = Enum.TextXAlignment.Left
+chanceLabel.ZIndex = 302
+chanceLabel.Parent = content
+local sliderTrack = Instance.new("Frame")
+sliderTrack.Size = UDim2.new(1, 0, 0, 20)
+sliderTrack.Position = UDim2.new(0, 0, 0, 20)
+sliderTrack.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+sliderTrack.BorderSizePixel = 0
+sliderTrack.ZIndex = 302
+sliderTrack.Parent = content
+createCorner(sliderTrack, 10)
+local sliderFill = Instance.new("Frame")
+sliderFill.Size = UDim2.new(trollSettings.spawnChance / 100, 0, 1, 0)
+sliderFill.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
+sliderFill.BorderSizePixel = 0
+sliderFill.ZIndex = 303
+sliderFill.Parent = sliderTrack
+createCorner(sliderFill, 10)
+-- Preset buttons for slider
+local presets = {25, 50, 75, 100}
+for i, pct in ipairs(presets) do
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 36, 0, 18)
+    btn.Position = UDim2.new(0, (i - 1) * 40 + 4, 0, 42)
+    btn.BackgroundColor3 = pct == trollSettings.spawnChance and Color3.fromRGB(255, 80, 80) or Color3.fromRGB(50, 50, 55)
+    btn.BorderSizePixel = 0
+    btn.Text = pct .. "%"
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.TextSize = 10
+    btn.Font = Enum.Font.GothamBold
+    btn.ZIndex = 302
+    btn.Parent = content
+    createCorner(btn, 4)
+    btn.MouseButton1Click:Connect(function()
+        trollSettings.spawnChance = pct
+        chanceLabel.Text = "Spawn Chance: " .. pct .. "%"
+        sliderFill.Size = UDim2.new(pct / 100, 0, 1, 0)
+        for _, child in ipairs(content:GetChildren()) do
+            if child:IsA("TextButton") and child.Position.Y.Offset == 42 then
+                local val = tonumber(child.Text:match("%d+"))
+                child.BackgroundColor3 = (val == pct) and Color3.fromRGB(255, 80, 80) or Color3.fromRGB(50, 50, 55)
+            end
+        end
+    end)
+end
+-- Manual input
+local manualBox = Instance.new("TextBox")
+manualBox.Size = UDim2.new(0, 50, 0, 18)
+manualBox.Position = UDim2.new(0, 168, 0, 42)
+manualBox.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+manualBox.BorderSizePixel = 0
+manualBox.Text = tostring(trollSettings.spawnChance)
+manualBox.PlaceholderText = "0-100"
+manualBox.TextColor3 = Color3.new(1, 1, 1)
+manualBox.TextSize = 10
+manualBox.Font = Enum.Font.GothamBold
+manualBox.ZIndex = 302
+manualBox.ClearTextOnFocus = false
+manualBox.Parent = content
+createCorner(manualBox, 4)
+manualBox.FocusLost:Connect(function()
+    local val = math.clamp(tonumber(manualBox.Text) or 100, 0, 100)
+    trollSettings.spawnChance = val
+    manualBox.Text = tostring(val)
+    chanceLabel.Text = "Spawn Chance: " .. val .. "%"
+    sliderFill.Size = UDim2.new(val / 100, 0, 1, 0)
+end)
+
+-- ====== TOGGLES ======
+local toggleY = 66
+local function makeToggle(y, text, default, onToggle)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0.48, 0, 0, 24)
+    btn.BackgroundColor3 = default and Color3.fromRGB(60, 120, 60) or Color3.fromRGB(50, 50, 55)
+    btn.BorderSizePixel = 0
+    btn.Text = (default and "✓ " or "x ") .. text
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.TextSize = 11
+    btn.Font = Enum.Font.GothamBold
+    btn.ZIndex = 302
+    btn.Parent = content
+    createCorner(btn, 6)
+    local state = default
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        btn.BackgroundColor3 = state and Color3.fromRGB(60, 120, 60) or Color3.fromRGB(50, 50, 55)
+        btn.Text = (state and "✓ " or "x ") .. text
+        onToggle(state)
+    end)
+    return btn
+end
+local mutToggle = makeToggle(toggleY, "Rand Mutation", trollSettings.randomMutation, function(v)
+    trollSettings.randomMutation = v
+end)
+mutToggle.Position = UDim2.new(0, 0, 0, toggleY)
+local traitToggle = makeToggle(toggleY, "Rand Traits", trollSettings.randomTraits, function(v)
+    trollSettings.randomTraits = v
+end)
+traitToggle.Position = UDim2.new(0.52, 0, 0, toggleY)
+
+-- ====== EMPTY PODIUM CHANCE ======
+local emptyLabel = Instance.new("TextLabel")
+emptyLabel.Size = UDim2.new(0.52, 0, 0, 20)
+emptyLabel.Position = UDim2.new(0, 0, 0, 94)
+emptyLabel.BackgroundTransparency = 1
+emptyLabel.Text = "Empty Podiums: " .. trollSettings.emptyPodiumChance .. "%"
+emptyLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+emptyLabel.TextSize = 10
+emptyLabel.Font = Enum.Font.GothamBold
+emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+emptyLabel.ZIndex = 302
+emptyLabel.Parent = content
+local emptyPresets = {0, 10, 20, 40}
+for i, pct in ipairs(emptyPresets) do
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 32, 0, 18)
+    btn.Position = UDim2.new(0.52, (i - 1) * 36, 0, 95)
+    btn.BackgroundColor3 = pct == trollSettings.emptyPodiumChance and Color3.fromRGB(200, 120, 50) or Color3.fromRGB(50, 50, 55)
+    btn.BorderSizePixel = 0
+    btn.Text = pct .. "%"
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.TextSize = 9
+    btn.Font = Enum.Font.GothamBold
+    btn.ZIndex = 302
+    btn.Parent = content
+    createCorner(btn, 4)
+    btn.MouseButton1Click:Connect(function()
+        trollSettings.emptyPodiumChance = pct
+        emptyLabel.Text = "Empty Podiums: " .. pct .. "%"
+        for _, child in ipairs(content:GetChildren()) do
+            if child:IsA("TextButton") and child.Position.Y.Offset == 95 then
+                local val = tonumber(child.Text:match("%d+"))
+                child.BackgroundColor3 = (val == pct) and Color3.fromRGB(200, 120, 50) or Color3.fromRGB(50, 50, 55)
+            end
+        end
+    end)
+end
+
+-- ====== RARITY SECTION ======
+local rarityHeader = Instance.new("TextLabel")
+rarityHeader.Size = UDim2.new(1, 0, 0, 20)
+rarityHeader.Position = UDim2.new(0, 0, 0, 118)
+rarityHeader.BackgroundTransparency = 1
+rarityHeader.Text = "RARITY SPAWN WEIGHTS (click to toggle):"
+rarityHeader.TextColor3 = Color3.fromRGB(255, 150, 150)
+rarityHeader.TextSize = 11
+rarityHeader.Font = Enum.Font.GothamBold
+rarityHeader.TextXAlignment = Enum.TextXAlignment.Left
+rarityHeader.ZIndex = 302
+rarityHeader.Parent = content
+local rarityScroll = Instance.new("ScrollingFrame")
+rarityScroll.Size = UDim2.new(1, 0, 0, 260)
+rarityScroll.Position = UDim2.new(0, 0, 0, 140)
+rarityScroll.BackgroundColor3 = Color3.fromRGB(25, 20, 20)
+rarityScroll.BorderSizePixel = 0
+rarityScroll.ScrollBarThickness = 5
+rarityScroll.ScrollBarImageColor3 = Color3.fromRGB(255, 80, 80)
+rarityScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+rarityScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+rarityScroll.ZIndex = 302
+rarityScroll.Parent = content
+createCorner(rarityScroll, 6)
+local rarityLayout = Instance.new("UIListLayout")
+rarityLayout.SortOrder = Enum.SortOrder.LayoutOrder
+rarityLayout.Padding = UDim.new(0, 3)
+rarityLayout.Parent = rarityScroll
+local rarityPad = Instance.new("UIPadding")
+rarityPad.PaddingTop = UDim.new(0, 4)
+rarityPad.PaddingLeft = UDim.new(0, 4)
+rarityPad.PaddingRight = UDim.new(0, 4)
+rarityPad.PaddingBottom = UDim.new(0, 4)
+rarityPad.Parent = rarityScroll
+local rarityBtns = {}
+for order, rarityName in ipairs(RARITY_ORDER) do
+    local count = ANIMALS_BY_RARITY[rarityName] and #ANIMALS_BY_RARITY[rarityName] or 0
+    local weight = RARITY_WEIGHTS[rarityName] or 0
+    local color = RARITY_COLORS[rarityName] or Color3.fromRGB(150, 150, 150)
+    local enabled = trollSettings.enabledRarities[rarityName]
+    local row = Instance.new("Frame")
+    row.Name = "Rarity_" .. rarityName
+    row.Size = UDim2.new(1, 0, 0, 34)
+    row.LayoutOrder = order
+    row.BackgroundColor3 = enabled and Color3.fromRGB(35, 30, 30) or Color3.fromRGB(20, 18, 18)
+    row.BorderSizePixel = 0
+    row.ZIndex = 303
+    row.Parent = rarityScroll
+    createCorner(row, 4)
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Name = "Toggle"
+    toggleBtn.Size = UDim2.new(0, 24, 0, 24)
+    toggleBtn.Position = UDim2.new(0, 3, 0.5, 0)
+    toggleBtn.AnchorPoint = Vector2.new(0, 0.5)
+    toggleBtn.BackgroundColor3 = enabled and Color3.fromRGB(60, 180, 60) or Color3.fromRGB(80, 30, 30)
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.Text = enabled and "✓" or "x"
+    toggleBtn.TextColor3 = Color3.new(1, 1, 1)
+    toggleBtn.TextSize = 14
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.ZIndex = 304
+    toggleBtn.Parent = row
+    createCorner(toggleBtn, 4)
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Size = UDim2.new(0, 100, 1, 0)
+    nameLabel.Position = UDim2.new(0, 30, 0, 0)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Text = rarityName
+    nameLabel.TextColor3 = color
+    nameLabel.TextSize = 14
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    nameLabel.ZIndex = 304
+    nameLabel.Parent = row
+    local countLabel = Instance.new("TextLabel")
+    countLabel.Size = UDim2.new(0, 40, 0, 20)
+    countLabel.Position = UDim2.new(0, 136, 0.5, 0)
+    countLabel.AnchorPoint = Vector2.new(0, 0.5)
+    countLabel.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    countLabel.BackgroundTransparency = 0.5
+    countLabel.Text = count
+    countLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+    countLabel.TextSize = 12
+    countLabel.Font = Enum.Font.GothamBold
+    countLabel.ZIndex = 304
+    countLabel.Parent = row
+    createCorner(countLabel, 3)
+    -- Editable weight box (click to type a new weight!)
+    local weightBox = Instance.new("TextBox")
+    weightBox.Size = UDim2.new(0, 70, 0, 22)
+    weightBox.Position = UDim2.new(1, -74, 0.5, 0)
+    weightBox.AnchorPoint = Vector2.new(0, 0.5)
+    weightBox.BackgroundColor3 = Color3.fromRGB(30, 25, 10)
+    weightBox.BorderSizePixel = 0
+    weightBox.Text = tostring(weight)
+    weightBox.TextColor3 = Color3.fromRGB(255, 200, 100)
+    weightBox.TextSize = 12
+    weightBox.Font = Enum.Font.GothamBold
+    weightBox.ClearTextOnFocus = false
+    weightBox.ZIndex = 304
+    weightBox.Parent = row
+    createCorner(weightBox, 4)
+    createStroke(weightBox, Color3.fromRGB(100, 80, 40), 1)
+    weightBox.FocusLost:Connect(function()
+        local newWeight = tonumber(weightBox.Text:gsub("%s+", ""))
+        if newWeight and newWeight >= 0 then
+            RARITY_WEIGHTS[rarityName] = newWeight
+            weightBox.Text = tostring(newWeight)
+        else
+            weightBox.Text = tostring(RARITY_WEIGHTS[rarityName] or 10)
+        end
+    end)
+    rarityBtns[rarityName] = {row = row, toggle = toggleBtn}
+    toggleBtn.MouseButton1Click:Connect(function()
+        local newState = not trollSettings.enabledRarities[rarityName]
+        trollSettings.enabledRarities[rarityName] = newState
+        toggleBtn.BackgroundColor3 = newState and Color3.fromRGB(60, 180, 60) or Color3.fromRGB(80, 30, 30)
+        toggleBtn.Text = newState and "✓" or "x"
+        row.BackgroundColor3 = newState and Color3.fromRGB(35, 30, 30) or Color3.fromRGB(20, 18, 18)
+    end)
+end
+
+-- ====== ALL / NONE BUTTONS ======
+local allRarBtn = Instance.new("TextButton")
+allRarBtn.Size = UDim2.new(0.48, 0, 0, 26)
+allRarBtn.Position = UDim2.new(0, 0, 0, 406)
+allRarBtn.BackgroundColor3 = Color3.fromRGB(60, 100, 60)
+allRarBtn.BorderSizePixel = 0
+allRarBtn.Text = "✅ All Rarities"
+allRarBtn.TextColor3 = Color3.new(1, 1, 1)
+allRarBtn.TextSize = 11
+allRarBtn.Font = Enum.Font.GothamBold
+allRarBtn.ZIndex = 302
+allRarBtn.Parent = content
+createCorner(allRarBtn, 6)
+allRarBtn.MouseButton1Click:Connect(function()
+    for _, r in ipairs(RARITY_ORDER) do
+        trollSettings.enabledRarities[r] = true
+        if rarityBtns[r] then
+            rarityBtns[r].toggle.BackgroundColor3 = Color3.fromRGB(60, 180, 60)
+            rarityBtns[r].toggle.Text = "✓"
+            rarityBtns[r].row.BackgroundColor3 = Color3.fromRGB(35, 30, 30)
+        end
+    end
+end)
+local noneRarBtn = Instance.new("TextButton")
+noneRarBtn.Size = UDim2.new(0.48, 0, 0, 26)
+noneRarBtn.Position = UDim2.new(0.52, 0, 0, 406)
+noneRarBtn.BackgroundColor3 = Color3.fromRGB(100, 40, 40)
+noneRarBtn.BorderSizePixel = 0
+noneRarBtn.Text = "❌ None"
+noneRarBtn.TextColor3 = Color3.new(1, 1, 1)
+noneRarBtn.TextSize = 11
+noneRarBtn.Font = Enum.Font.GothamBold
+noneRarBtn.ZIndex = 302
+noneRarBtn.Parent = content
+createCorner(noneRarBtn, 6)
+noneRarBtn.MouseButton1Click:Connect(function()
+    for _, r in ipairs(RARITY_ORDER) do
+        trollSettings.enabledRarities[r] = false
+        if rarityBtns[r] then
+            rarityBtns[r].toggle.BackgroundColor3 = Color3.fromRGB(80, 30, 30)
+            rarityBtns[r].toggle.Text = "x"
+            rarityBtns[r].row.BackgroundColor3 = Color3.fromRGB(20, 18, 18)
+        end
+    end
+end)
+
+-- ====== QUICK PRESETS ======
+local presetLabel = Instance.new("TextLabel")
+presetLabel.Size = UDim2.new(1, 0, 0, 16)
+presetLabel.Position = UDim2.new(0, 0, 0, 436)
+presetLabel.BackgroundTransparency = 1
+presetLabel.Text = "Quick Presets:"
+presetLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+presetLabel.TextSize = 10
+presetLabel.Font = Enum.Font.GothamBold
+presetLabel.TextXAlignment = Enum.TextXAlignment.Left
+presetLabel.ZIndex = 302
+presetLabel.Parent = content
+local function setRarityPreset(enabledList)
+    for _, r in ipairs(RARITY_ORDER) do
+        local on = false
+        for _, e in ipairs(enabledList) do if e == r then on = true; break end end
+        trollSettings.enabledRarities[r] = on
+        if rarityBtns[r] then
+            rarityBtns[r].toggle.BackgroundColor3 = on and Color3.fromRGB(60, 180, 60) or Color3.fromRGB(80, 30, 30)
+            rarityBtns[r].toggle.Text = on and "✓" or "x"
+            rarityBtns[r].row.BackgroundColor3 = on and Color3.fromRGB(35, 30, 30) or Color3.fromRGB(20, 18, 18)
+        end
+    end
+end
+local presetDefs = {
+    {text = "� Trash", rarities = {"Common","Rare","Epic","Legendary","Mythic","Brainrot God"}},
+    {text = "💎 Common", rarities = {"Common","Rare","Epic","Legendary","Mythic"}},
+    {text = "🔒 Secret", rarities = {"Secret"}},
+    {text = "👑 S+OG", rarities = {"Secret","OG"}},
+    {text = "🎉 Events", rarities = {"Taco","Spooky","Festive","Valentines","St Patrick"}},
+}
+for i, preset in ipairs(presetDefs) do
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 60, 0, 20)
+    btn.Position = UDim2.new(0, (i - 1) * 63, 0, 454)
+    btn.BackgroundColor3 = Color3.fromRGB(50, 40, 50)
+    btn.BorderSizePixel = 0
+    btn.Text = preset.text
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.TextSize = 10
+    btn.Font = Enum.Font.GothamBold
+    btn.ZIndex = 302
+    btn.Parent = content
+    createCorner(btn, 4)
+    btn.MouseButton1Click:Connect(function()
+        setRarityPreset(preset.rarities)
+    end)
+end
+
+-- ====== STATUS ======
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Name = "TrollStatus"
+statusLabel.Size = UDim2.new(1, 0, 0, 20)
+statusLabel.Position = UDim2.new(0, 0, 0, 482)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Ready to scramble!"
+statusLabel.TextColor3 = Color3.fromRGB(150, 255, 150)
+statusLabel.TextSize = 12
+statusLabel.Font = Enum.Font.GothamBold
+statusLabel.ZIndex = 302
+statusLabel.Parent = content
+
+-- ====== SCRAMBLE BUTTON ======
+local scrambleBtn = Instance.new("TextButton")
+scrambleBtn.Name = "ScrambleBtn"
+scrambleBtn.Size = UDim2.new(1, 0, 0, 44)
+scrambleBtn.Position = UDim2.new(0, 0, 0, 504)
+scrambleBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+scrambleBtn.BorderSizePixel = 0
+scrambleBtn.Text = "💀 SCRAMBLE OTHER PLOTS"
+scrambleBtn.TextColor3 = Color3.new(1, 1, 1)
+scrambleBtn.TextSize = 16
+scrambleBtn.Font = Enum.Font.GothamBlack
+scrambleBtn.ZIndex = 302
+scrambleBtn.Parent = content
+createCorner(scrambleBtn, 8)
+createStroke(scrambleBtn, Color3.fromRGB(255, 100, 100), 2)
+scrambleBtn.MouseButton1Click:Connect(function()
+    if trollScrambling then return end
+    scrambleBtn.Text = "💀 Scrambling..."
+    scrambleBtn.BackgroundColor3 = Color3.fromRGB(100, 30, 30)
+    statusLabel.Text = "Scrambling..."
+    statusLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+    task.defer(function()
+        local spawned, plots = trollScramblePlots()
+        if spawned and spawned > 0 then
+            statusLabel.Text = "✅ " .. spawned .. " spawned on " .. plots .. " plots!"
+            statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+            scrambleBtn.Text = "✅ Done! (" .. spawned .. " spawned)"
+            scrambleBtn.BackgroundColor3 = Color3.fromRGB(50, 180, 50)
+        elseif plots and plots > 0 then
+            statusLabel.Text = "⚠ " .. plots .. " plots, 0 spawned (F9)"
+            statusLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+            scrambleBtn.Text = "⚠ Check Dev Console (F9)"
+            scrambleBtn.BackgroundColor3 = Color3.fromRGB(150, 100, 50)
+        else
+            local chCount = 0
+            pcall(function() for _ in pairs(_RawSync2:GetAllChannels()) do chCount = chCount + 1 end end)
+            statusLabel.Text = "⚠ 0 plots! (channels: " .. chCount .. ") F9"
+            statusLabel.TextColor3 = Color3.fromRGB(255, 150, 100)
+            scrambleBtn.Text = "⚠ Nothing found"
+            scrambleBtn.BackgroundColor3 = Color3.fromRGB(150, 100, 50)
+        end
+        task.delay(2.5, function()
+            scrambleBtn.Text = "💀 SCRAMBLE OTHER PLOTS"
+            scrambleBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+        end)
+    end)
+end)
+
+-- ====== RESTORE BUTTON ======
+local restoreBtn = Instance.new("TextButton")
+restoreBtn.Name = "RestoreBtn"
+restoreBtn.Size = UDim2.new(1, 0, 0, 36)
+restoreBtn.Position = UDim2.new(0, 0, 0, 552)
+restoreBtn.BackgroundColor3 = Color3.fromRGB(50, 80, 150)
+restoreBtn.BorderSizePixel = 0
+restoreBtn.Text = "🔄 RESTORE ORIGINAL DATA"
+restoreBtn.TextColor3 = Color3.new(1, 1, 1)
+restoreBtn.TextSize = 14
+restoreBtn.Font = Enum.Font.GothamBlack
+restoreBtn.ZIndex = 302
+restoreBtn.Parent = content
+createCorner(restoreBtn, 8)
+createStroke(restoreBtn, Color3.fromRGB(100, 150, 255), 2)
+restoreBtn.MouseButton1Click:Connect(function()
+    if trollScrambling then return end
+    if not hasBackup then
+        statusLabel.Text = "⚠ No backup data to restore!"
+        statusLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+        return
+    end
+    restoreBtn.Text = "🔄 Restoring..."
+    restoreBtn.BackgroundColor3 = Color3.fromRGB(30, 50, 100)
+    statusLabel.Text = "Restoring original data..."
+    statusLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
+    task.defer(function()
+        local restored = restoreScrambledPlots()
+        if restored > 0 then
+            statusLabel.Text = "✅ Restored " .. restored .. " podiums!"
+            statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+            restoreBtn.Text = "✅ Restored!"
+            restoreBtn.BackgroundColor3 = Color3.fromRGB(50, 150, 50)
+        else
+            statusLabel.Text = "⚠ Nothing to restore"
+            statusLabel.TextColor3 = Color3.fromRGB(255, 200, 100)
+        end
+        task.delay(2, function()
+            restoreBtn.Text = "🔄 RESTORE ORIGINAL DATA"
+            restoreBtn.BackgroundColor3 = Color3.fromRGB(50, 80, 150)
+        end)
+    end)
+end)
+
+-- ====== ICON CLICK → TOGGLE PANEL (hides icon when panel open) ======
+iconBtn.MouseButton1Click:Connect(function()
+    if iconHasDragged then return end -- Don't toggle if we just dragged
+    local opening = not panel.Visible
+    if opening then
+        -- Clamp panel on-screen before showing
+        local cam = workspace.CurrentCamera
+        local vw = cam and cam.ViewportSize.X or 1920
+        local vh = cam and cam.ViewportSize.Y or 1080
+        local cx = math.clamp(panel.Position.X.Offset, 0, vw - PANEL_W)
+        local cy = math.clamp(panel.Position.Y.Offset, 0, vh - PANEL_H)
+        panel.Position = UDim2.new(0, cx, 0, cy)
+    end
+    panel.Visible = opening
+    iconBtn.Visible = not opening -- Hide icon when panel is open
+    Config.panelOpen = opening
+    saveConfig()
+end)
+
+-- ====== RESTORE PANEL OPEN STATE ON LOAD ======
+if Config.panelOpen then
+    local cam = workspace.CurrentCamera
+    local vw = cam and cam.ViewportSize.X or 1920
+    local vh = cam and cam.ViewportSize.Y or 1080
+    local cx = math.clamp(panel.Position.X.Offset, 0, vw - PANEL_W)
+    local cy = math.clamp(panel.Position.Y.Offset, 0, vh - PANEL_H)
+    panel.Position = UDim2.new(0, cx, 0, cy)
+    panel.Visible = true
+    iconBtn.Visible = false
+end
+print("[TrollScrambler] 🎭 Loaded! Click the icon to open.")
