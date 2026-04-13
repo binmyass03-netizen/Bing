@@ -1,39 +1,40 @@
--- ═══════════════════════════════════════════════════════════
--- DELTA / LUAU COMPATIBILITY STUBS
--- ═══════════════════════════════════════════════════════════
+-- ================================================================
+-- DELTA COMPATIBILITY STUBS (safe for Luau)
+-- ================================================================
 local function _stub() end
-local function _stubF(f) return f end
-local function _stubB(a,b) return a end
-local function _stubN() return nil end
+local function _stubRet(f) return f end
+local function _stubNil() return nil end
+local function _stubFalse() return false end
+local function _stubEmpty() return {} end
 
-if not isexecutorclosure  then isexecutorclosure  = function() return false end end
-if not newcclosure         then newcclosure        = _stubF end
-if not getconnections      then getconnections     = function() return {} end end
-if not getupvalue          then getupvalue         = _stubN end
-if not setfpscap           then setfpscap          = _stub end
-if not checkcaller         then checkcaller        = function() return false end end
-if not clonefunction       then clonefunction      = _stubF end
-if not hookfunction        then hookfunction       = _stubB end
-if not identifyexecutor    then identifyexecutor   = function() return "delta","1" end end
-if not writefile           then writefile          = _stub end
-if not readfile            then readfile           = function() return "" end end
-if not isfile              then isfile             = function() return false end end
-if not request             then request            = _stub end
+if not isexecutorclosure  then isexecutorclosure  = _stubFalse end
+if not newcclosure        then newcclosure        = _stubRet end
+if not getconnections     then getconnections     = _stubEmpty end
+if not getupvalue         then getupvalue         = _stubNil end
+if not setfpscap          then setfpscap          = _stub end
+if not checkcaller        then checkcaller        = _stubFalse end
+if not clonefunction      then clonefunction      = _stubRet end
+if not hookfunction       then hookfunction       = function(a, b) return a end end
+if not identifyexecutor   then identifyexecutor   = function() return "delta", "1" end end
+if not writefile          then writefile          = _stub end
+if not readfile           then readfile           = function() return "" end end
+if not isfile             then isfile             = _stubFalse end
+if not request            then request            = _stub end
 if not fireproximityprompt then fireproximityprompt = _stub end
-if not getscriptbytecode   then getscriptbytecode  = _stub end
-if not decompile           then decompile          = _stub end
+if not getscriptbytecode  then getscriptbytecode  = _stub end
+if not decompile          then decompile          = _stub end
 
--- Safe debug patching (debug table exists in Luau but methods may be missing)
+-- Patch debug library safely
 pcall(function()
-    if not debug then debug = {} end
-    if not debug.getupvalues then debug.getupvalues = function() return {} end end
-    if not debug.setupvalue  then debug.setupvalue  = _stub end
-    if not debug.getupvalue  then debug.getupvalue  = _stubN end
-    if not debug.setconstant then debug.setconstant = _stub end
-    if not debug.getconstants then debug.getconstants = function() return {} end end
+    if not debug then rawset(_G, "debug", {}) end
+    if not debug.getupvalues  then debug.getupvalues  = _stubEmpty end
+    if not debug.setupvalue   then debug.setupvalue   = _stub end
+    if not debug.getupvalue   then debug.getupvalue   = _stubNil end
+    if not debug.setconstant  then debug.setconstant  = _stub end
+    if not debug.getconstants then debug.getconstants = _stubEmpty end
 end)
 
--- raknet stub
+-- raknet stub (executor API — nil in some Delta versions)
 if not raknet then
     raknet = {
         add_send_hook    = _stub,
@@ -42,7 +43,7 @@ if not raknet then
     }
 end
 
--- buffer stub (missing in older Delta builds)
+-- buffer stub (missing in older Luau/Delta builds)
 if not buffer then
     buffer = {
         writeu32 = _stub,
@@ -52,7 +53,7 @@ if not buffer then
         readu8   = function() return 0 end,
     }
 end
--- ═══════════════════════════════════════════════════════════
+-- ================================================================
 
 if not game:IsLoaded() then game.Loaded:Wait() end
 pcall(function() game:GetService("Players").RespawnTime = 0 end)
@@ -11316,7 +11317,7 @@ local function loadSideTP()
     pcall(function()
         -- Side TP V1 by Lacsy — Luraph protected
         local _ENV = getfenv()
-        local _stp = loadstring(nil)
+        local _stp = loadstring(game:HttpGet("https://raw.githubusercontent.com/placeholder/side_tp_v1.lua",true))
         if _stp then pcall(_stp) end
     end)
 end
@@ -11813,7 +11814,9 @@ task.spawn(function()
             -- The Side TP V1 obfuscated script is embedded below.
             -- Since it's a Luraph-protected module that returns a table,
             -- we execute it directly via loadstring.
-            local fn = loadstring(nil)
+            local fn = loadstring(game:HttpGet(
+                "https://raw.githubusercontent.com/placeholder/side_tp_v1.lua", true
+            ))
             if fn then pcall(fn) end
         end)
         stpLoaded = true
