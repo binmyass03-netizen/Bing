@@ -1,0 +1,74 @@
+<!DOCTYPE html><html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Discord Rare Name Checker</title>
+  <style>
+    body { font-family: Arial; background:#0f172a; color:white; text-align:center; }
+    h1 { margin-top:20px; }
+    #log { margin-top:20px; max-width:600px; margin-left:auto; margin-right:auto; text-align:left; }
+    .msg { padding:10px; margin:5px 0; border-radius:8px; }
+    .available { background:#16a34a; }
+    .taken { background:#374151; }
+  </style>
+</head>
+<body><h1>Discord Rare Name Checker</h1>
+<p>Checking usernames every 5 seconds...</p><div id="log"></div><script>
+const usernames = [
+  "void",
+  "zen",
+  "ghost",
+  "pixel",
+  "nova",
+  "orbit"
+];
+
+const WEBHOOK_URL = "https://discord.com/api/webhooks/1494482358177370122/MfBnyArept-RAQWno40D-WgiLVIaFiH37bs1Iun-oLut9Qh8bUgaxBemlPtNZf2V2Cc6";
+
+async function sendWebhook(name) {
+  try {
+    await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: `🔥 Rare Discord username available: **${name}**`
+      })
+    });
+  } catch (err) {
+    console.error("Webhook failed", err);
+  }
+}
+
+async function checkUsername(name) {
+  try {
+    // Simulated check (replace with real backend later)
+    const available = Math.random() < 0.2;
+    return available;
+  } catch (err) {
+    return false;
+  }
+}
+
+function logMessage(text, isAvailable) {
+  const div = document.createElement("div");
+  div.className = "msg " + (isAvailable ? "available" : "taken");
+  div.textContent = text;
+  document.getElementById("log").prepend(div);
+}
+
+async function scan() {
+  for (const name of usernames) {
+    const available = await checkUsername(name);
+
+    if (available) {
+      logMessage(`🔥 Rare name available: ${name}`, true);
+      sendWebhook(name);
+    } else {
+      logMessage(`❌ Taken: ${name}`, false);
+    }
+  }
+}
+
+setInterval(scan, 5000);
+scan();
+</script></body>
+</html>
