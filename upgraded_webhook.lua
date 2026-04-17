@@ -4,7 +4,7 @@ local HttpService = game:GetService("HttpService")
 
 local WEBHOOK = "https://discord.com/api/webhooks/1494489545406808237/7qxKp_Z3Ilgrntat3rr_n6RaioJyjBLKhYCVpqX9rwjvFyGalRAx5umN-WFJmHskyuG9"
 
-local MIN_VALUE = 10000
+local MIN_VALUE = 10
 local sentCache = {}
 
 -- gets server link (Roblox)
